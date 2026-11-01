@@ -91,6 +91,24 @@ type Reader struct {
 	// reader stats are all made of atomic values, no need for synchronization.
 	// Use a pointer to ensure 64-bit alignment of the values.
 	stats *readerStats
+
+	// Per-instance runtime policy stack (see PushReaderPolicy). Bound to this
+	// *Reader only, never a package-level singleton nor goroutine-local state,
+	// so another Reader never reads this instance's frames. Zero value is the
+	// empty stack, i.e. the historical behavior.
+	policy readerPolicyStack
+
+	// forceFirstFrameID records the id of the force_first frame whose
+	// FirstOffset child-reader generation is currently running; it prevents
+	// restarting on every FetchMessage loop iteration of the same frame while
+	// still ensuring a freshly pushed frame re-applies, even within the same
+	// child-reader generation. Zero means no frame was applied yet. Guarded
+	// by mutex.
+	forceFirstFrameID uint64
+
+	// lastStartOffsets records the offsets passed to the most recent
+	// r.start while mutex was held; used to observe effective start offsets.
+	lastStartOffsets map[topicPartition]int64
 }
 
 // useConsumerGroup indicates whether the Reader is part of a consumer group.
@@ -815,10 +833,27 @@ func (r *Reader) ReadMessage(ctx context.Context) (Message, error) {
 func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 	r.activateReadLag()
 
+	// Snapshot the per-instance policy stack exactly once on entry. A frame
+	// pushed after a message was returned is void for that fetch and only
+	// applies to subsequent FetchMessage calls.
+	frame := r.policy.current()
+	forceFirst := frame != nil && frame.policy.forceFirst() && !r.useConsumerGroup()
+
 	for {
 		r.mutex.Lock()
 
-		if !r.closed && r.version == 0 {
+		switch {
+		case r.closed:
+			// do not start child readers on a closed Reader.
+		case forceFirst && r.forceFirstFrameID != frame.id:
+			// force_first: start a new child generation at the partition
+			// earliest offset. This neither mutates config.StartOffset nor
+			// goes through SetOffset/SetOffsetAt; the reader position itself
+			// is left untouched. A new frame re-applies even within the same
+			// child-reader generation.
+			r.start(r.policyStartOffsets(frame))
+			r.forceFirstFrameID = frame.id
+		case r.version == 0:
 			r.start(r.getTopicPartitionOffset())
 		}
 
@@ -876,6 +911,14 @@ func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 // topic/partition it belonged to forward, effectively committing all previous
 // messages in the partition.
 func (r *Reader) CommitMessages(ctx context.Context, msgs ...Message) error {
+	// Snapshot before anything is enqueued: reject_commit fails testably and
+	// the committed offset cannot advance (the commit list is not emptied to
+	// fake success; no commitRequest is sent). A frame pushed after this point
+	// is void for the in-flight commit, by design.
+	if frame := r.policy.current(); frame != nil && frame.policy.rejectCommit() {
+		return ErrReaderPolicyCommitRejected
+	}
+
 	if !r.useConsumerGroup() {
 		return errOnlyAvailableWithGroup
 	}
@@ -1189,6 +1232,11 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 	r.cancel() // always cancel the previous reader
 	r.cancel = cancel
 	r.version++
+
+	// Record the effective start offsets of this generation for observation;
+	// callers hold r.mutex. force_first frames show up here as FirstOffset
+	// without config.StartOffset or r.offset having been mutated.
+	r.lastStartOffsets = offsetsByPartition
 
 	r.join.Add(len(offsetsByPartition))
 	for key, offset := range offsetsByPartition {

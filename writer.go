@@ -218,6 +218,13 @@ type Writer struct {
 	// for extra synchronization to access this field.
 	roundRobin RoundRobin
 
+	// Per-instance runtime policy stack (see PushWriterPolicy). It is bound
+	// to this *Writer only: it is neither a package-level singleton nor
+	// goroutine-local state, so another Writer never reads this instance's
+	// frames. The zero value is the empty stack, i.e. the historical
+	// behavior.
+	policy writerPolicyStack
+
 	// non-nil when a transport was created by NewWriter, remove in 1.0.
 	transport *Transport
 }
@@ -611,6 +618,19 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 		return errors.New("kafka.(*Writer).WriteMessages: cannot create a kafka writer with a nil address")
 	}
 
+	// Snapshot the per-instance policy stack exactly once at entry. Frames
+	// pushed later (after messages are queued or the call starts waiting for
+	// acks) are void for this call: they only apply to subsequent calls.
+	// The three policy dimensions are read independently below, never as a
+	// single boolean.
+	frame := w.policy.current()
+
+	if frame != nil && frame.policy.rejectWrite() {
+		// reject_write fails before enter(): nothing is tracked as in
+		// flight, nothing enters the internal queue and no Produce is sent.
+		return ErrWriterPolicyRejectWrite
+	}
+
 	if !w.enter() {
 		return io.ErrClosedPipe
 	}
@@ -618,6 +638,17 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 
 	if len(msgs) == 0 {
 		return nil
+	}
+
+	if frame != nil && frame.policy.requireKey() {
+		// require_key fails before partition resolution, queueing and any
+		// Produce request; keyless messages must not silently fall onto the
+		// balancer's default partition.
+		for i := range msgs {
+			if msgs[i].Key == nil {
+				return ErrWriterPolicyKeyRequired
+			}
+		}
 	}
 
 	balancer := w.balancer()
@@ -635,6 +666,18 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 		}
 	}
 
+	// force_all and force_flush both turn an otherwise asynchronous call into
+	// one that observably waits for the frame's batches; this is derived from
+	// the entry snapshot only.
+	waitForDelivery := !w.Async
+	forceFlush := false
+	if frame != nil {
+		if frame.policy.forceAllAcks() || frame.policy.forceFlush() {
+			waitForDelivery = true
+		}
+		forceFlush = frame.policy.forceFlush()
+	}
+
 	// We use int32 here to halve the memory footprint (compared to using int
 	// on 64 bits architectures). We map lists of the message indexes instead
 	// of the message values for the same reason, int32 is 4 bytes, vs a full
@@ -648,12 +691,19 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 			return err
 		}
 
-		numPartitions, err := w.partitions(ctx, topic)
-		if err != nil {
-			return err
+		var partition int
+		if frame != nil && frame.policy.forcePartition() {
+			// force_partition honors the explicit Message.Partition and does
+			// not run the Balancer; metadata partition count is not needed.
+			partition = msg.Partition
+		} else {
+			var numPartitions int
+			numPartitions, err = w.partitions(ctx, topic)
+			if err != nil {
+				return err
+			}
+			partition = balancer.Balance(msg, loadCachedPartitions(numPartitions)...)
 		}
-
-		partition := balancer.Balance(msg, loadCachedPartitions(numPartitions)...)
 
 		key := topicPartition{
 			topic:     topic,
@@ -663,8 +713,8 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 		assignments[key] = append(assignments[key], int32(i))
 	}
 
-	batches := w.batchMessages(msgs, assignments)
-	if w.Async {
+	batches := w.batchMessages(msgs, assignments, frame, waitForDelivery, forceFlush)
+	if !waitForDelivery {
 		return nil
 	}
 
@@ -695,9 +745,12 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 	return werr
 }
 
-func (w *Writer) batchMessages(messages []Message, assignments map[topicPartition][]int32) map[*writeBatch][]int32 {
+func (w *Writer) batchMessages(messages []Message, assignments map[topicPartition][]int32, frame *WriterPolicyFrame, waitForDelivery, forceFlush bool) map[*writeBatch][]int32 {
+	// The frame's messages must be tracked when the call synchronously waits
+	// for delivery (plain sync mode, or force_all/force_flush overriding
+	// Async); a purely async pin frame needs no per-batch index map.
 	var batches map[*writeBatch][]int32
-	if !w.Async {
+	if waitForDelivery {
 		batches = make(map[*writeBatch][]int32, len(assignments))
 	}
 
@@ -714,7 +767,7 @@ func (w *Writer) batchMessages(messages []Message, assignments map[topicPartitio
 			writer = newPartitionWriter(w, key)
 			w.writers[key] = writer
 		}
-		wbatches := writer.writeMessages(messages, indexes)
+		wbatches := writer.writeMessages(messages, indexes, frame, forceFlush)
 
 		for batch, idxs := range wbatches {
 			batches[batch] = idxs
@@ -724,16 +777,19 @@ func (w *Writer) batchMessages(messages []Message, assignments map[topicPartitio
 	return batches
 }
 
-func (w *Writer) produce(key topicPartition, batch *writeBatch) (*ProduceResponse, error) {
+func (w *Writer) produce(key topicPartition, batch *writeBatch, acks RequiredAcks) (*ProduceResponse, error) {
 	timeout := w.writeTimeout()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	return w.client(timeout).Produce(ctx, &ProduceRequest{
-		Partition:    int(key.partition),
-		Topic:        key.topic,
-		RequiredAcks: w.RequiredAcks,
+		Partition: int(key.partition),
+		Topic:     key.topic,
+		// acks is resolved from the batch's captured policy frames, never by
+		// mutating w.RequiredAcks; a force_all frame upgrades the batch to
+		// RequireAll without touching the Writer's flat field.
+		RequiredAcks: acks,
 		Compression:  w.Compression,
 		Records: &writerRecords{
 			msgs: batch.msgs,
@@ -1023,7 +1079,7 @@ func (ptw *partitionWriter) writeBatches() {
 	}
 }
 
-func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*writeBatch][]int32 {
+func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32, frame *WriterPolicyFrame, forceFlush bool) map[*writeBatch][]int32 {
 	ptw.mutex.Lock()
 	defer ptw.mutex.Unlock()
 
@@ -1031,7 +1087,11 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 	batchBytes := ptw.w.batchBytes()
 
 	var batches map[*writeBatch][]int32
-	if !ptw.w.Async {
+	waitForDelivery := !ptw.w.Async
+	if frame != nil && (frame.policy.forceAllAcks() || frame.policy.forceFlush()) {
+		waitForDelivery = true
+	}
+	if waitForDelivery {
 		batches = make(map[*writeBatch][]int32, 1)
 	}
 
@@ -1039,8 +1099,14 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 	assignMessage:
 		batch := ptw.currBatch
 		if batch == nil {
-			batch = ptw.newWriteBatch()
+			batch = ptw.newWriteBatch(frame)
 			ptw.currBatch = batch
+		} else {
+			// The message joined a batch opened by (possibly) another call;
+			// merge the frame attributes so the batch honors the strongest
+			// contributor: any force_all upgrades acks, any
+			// suppress_completion suppresses the successful callback.
+			batch.applyWriteFrame(frame)
 		}
 		if !batch.add(msgs[i], batchSize, batchBytes) {
 			batch.trigger()
@@ -1055,16 +1121,29 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 			ptw.currBatch = nil
 		}
 
-		if !ptw.w.Async {
+		if waitForDelivery {
 			batches[batch] = append(batches[batch], i)
 		}
 	}
+
+	if forceFlush && ptw.currBatch != nil {
+		// force_flush: the pending (not yet full, not timed out) batch is
+		// queued immediately, without touching BatchTimeout/BatchSize. The
+		// batch carries this frame's indexes, so the caller observably waits
+		// for it before WriteMessages returns.
+		batch := ptw.currBatch
+		batch.trigger()
+		ptw.queue.Put(batch)
+		ptw.currBatch = nil
+	}
+
 	return batches
 }
 
 // ptw.w can be accessed here because this is called with the lock ptw.mutex already held.
-func (ptw *partitionWriter) newWriteBatch() *writeBatch {
+func (ptw *partitionWriter) newWriteBatch(frame *WriterPolicyFrame) *writeBatch {
 	batch := newWriteBatch(time.Now(), ptw.w.batchTimeout())
+	batch.applyWriteFrame(frame)
 	ptw.w.spawn(func() { ptw.awaitBatch(batch) })
 	return batch
 }
@@ -1132,7 +1211,13 @@ func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
 		})
 
 		start := time.Now()
-		res, err = ptw.w.produce(key, batch)
+		// Resolve the ack level from the batch's captured frames; this never
+		// mutates w.RequiredAcks.
+		acks := ptw.w.RequiredAcks
+		if batch.requireAllAcks {
+			acks = RequireAll
+		}
+		res, err = ptw.w.produce(key, batch, acks)
 
 		stats.writes.observe(1)
 		stats.messages.observe(int64(len(batch.msgs)))
@@ -1177,7 +1262,11 @@ func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
 		}
 	}
 
-	if ptw.w.Completion != nil {
+	// suppress_completion only mutes the success callback; failures are
+	// always reported through Completion. Because Completion receives the
+	// whole batch, a batch that carries any suppressed frame skips the
+	// success callback for the entire batch.
+	if ptw.w.Completion != nil && !(err == nil && batch.suppressCompletion) {
 		ptw.w.Completion(batch.msgs, err)
 	}
 
@@ -1207,6 +1296,14 @@ type writeBatch struct {
 	done  chan struct{}
 	timer *time.Timer
 	err   error // result of the batch completion
+
+	// Policy attributes merged from the immutable WriterPolicyFrame
+	// snapshots captured by every WriteMessages call whose messages joined
+	// this batch. These fields are only read/written while partitionWriter
+	// mutex is held (at assignment time) and by the single writeBatch worker
+	// afterwards. Background workers never read the live stack.
+	requireAllAcks     bool
+	suppressCompletion bool
 }
 
 func newWriteBatch(now time.Time, timeout time.Duration) *writeBatch {
@@ -1215,6 +1312,21 @@ func newWriteBatch(now time.Time, timeout time.Duration) *writeBatch {
 		ready: make(chan struct{}),
 		done:  make(chan struct{}),
 		timer: time.NewTimer(timeout),
+	}
+}
+
+// applyWriteFrame merges a frame snapshot into the batch. A nil frame pins
+// everything. force_all upgrades acks for the whole batch, and any suppressed
+// contributor suppresses the success Completion for the whole batch.
+func (b *writeBatch) applyWriteFrame(frame *WriterPolicyFrame) {
+	if frame == nil {
+		return
+	}
+	if frame.policy.forceAllAcks() {
+		b.requireAllAcks = true
+	}
+	if frame.policy.suppressCompletion() {
+		b.suppressCompletion = true
 	}
 }
 
